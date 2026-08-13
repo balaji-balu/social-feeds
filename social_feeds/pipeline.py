@@ -31,6 +31,7 @@ class RunSummary:
     candidates: int
     completed_batches: int
     failed_batches: int
+    source_failures: int = 0
 
 
 @dataclass(frozen=True)
@@ -205,6 +206,28 @@ class _Store:
     def close(self) -> None:
         self.connection.close()
 
+    def recover_incomplete_batches(self) -> int:
+        with self.connection:
+            attempts = self.connection.execute(
+                """
+                UPDATE attempts SET status = 'failed', error = 'startup recovery'
+                WHERE status = 'processing'
+                """
+            ).rowcount
+            self.connection.execute(
+                "UPDATE batches SET status = 'failed_retryable' WHERE status = 'processing'"
+            )
+            self.connection.execute(
+                """
+                UPDATE posts SET status = 'candidate'
+                WHERE (source, source_id) IN (
+                    SELECT source, source_id FROM batch_posts
+                    WHERE batch_id IN (SELECT id FROM batches WHERE status = 'failed_retryable')
+                ) AND status = 'batched'
+                """
+            )
+        return attempts
+
 
 class PipelineRunner:
     def __init__(
@@ -222,36 +245,60 @@ class PipelineRunner:
         self._llm = llm
         self._pain_keywords = tuple(keyword.casefold() for keyword in pain_keywords)
         self._batch_size = batch_size
+        self._store.recover_incomplete_batches()
 
     async def run_once(self) -> RunSummary:
+        fetched_sources = await asyncio.gather(
+            *(self._fetch_source(source_name, source) for source_name, source in self._sources.items()),
+            return_exceptions=True,
+        )
         discovered = 0
         candidates: list[Post] = []
-        for source_name, source in self._sources.items():
-            fetched = await source.fetch()
-            source_batch = fetched if isinstance(fetched, SourceBatch) else SourceBatch(fetched)
-            expected_source = getattr(source, "source_name", source_name)
-            for post in source_batch.posts:
-                if post.source != expected_source:
-                    raise ValueError("source client returned a post for another source")
-                if self._store.add_post(post):
-                    discovered += 1
-                    if self._is_candidate(post):
-                        self._store.mark_candidate(post)
-                        candidates.append(post)
-            if source_batch.cursor is not None:
-                commit_cursor = getattr(source, "commit_cursor", None)
-                if commit_cursor is None:
-                    raise ValueError("source returned a cursor but cannot commit it")
-                commit_cursor(source_batch.cursor)
-            if source_batch.metadata is not None:
-                commit_metadata = getattr(source, "commit_metadata", None)
-                if commit_metadata is None:
-                    raise ValueError("source returned metadata but cannot commit it")
-                commit_metadata(source_batch.metadata)
-            expire_content = getattr(source, "expire_content", None)
-            if expire_content is not None:
-                expire_content()
+        source_failures = 0
+        for (source_name, source), fetched in zip(self._sources.items(), fetched_sources):
+            if isinstance(fetched, Exception):
+                source_failures += 1
+                continue
+            new_posts = self.ingest_source(source_name, source, fetched)
+            discovered += new_posts[0]
+            candidates.extend(new_posts[1])
+        completed, failed = await self.process_candidates(candidates)
+        return RunSummary(discovered, len(candidates), completed, failed, source_failures)
 
+    async def _fetch_source(self, source_name: str, source: SourceClient):
+        return await source.fetch()
+
+    def ingest_source(
+        self, source_name: str, source: SourceClient, fetched: Sequence[Post] | SourceBatch
+    ) -> tuple[int, list[Post]]:
+        source_batch = fetched if isinstance(fetched, SourceBatch) else SourceBatch(fetched)
+        candidates: list[Post] = []
+        discovered = 0
+        expected_source = getattr(source, "source_name", source_name)
+        for post in source_batch.posts:
+            if post.source != expected_source:
+                raise ValueError("source client returned a post for another source")
+            if self._store.add_post(post):
+                discovered += 1
+                if self._is_candidate(post):
+                    self._store.mark_candidate(post)
+                    candidates.append(post)
+        if source_batch.cursor is not None:
+            commit_cursor = getattr(source, "commit_cursor", None)
+            if commit_cursor is None:
+                raise ValueError("source returned a cursor but cannot commit it")
+            commit_cursor(source_batch.cursor)
+        if source_batch.metadata is not None:
+            commit_metadata = getattr(source, "commit_metadata", None)
+            if commit_metadata is None:
+                raise ValueError("source returned metadata but cannot commit it")
+            commit_metadata(source_batch.metadata)
+        expire_content = getattr(source, "expire_content", None)
+        if expire_content is not None:
+            expire_content()
+        return discovered, candidates
+
+    async def process_candidates(self, candidates: Sequence[Post]) -> tuple[int, int]:
         completed = 0
         failed = 0
         for offset in range(0, len(candidates), self._batch_size):
@@ -259,14 +306,16 @@ class PipelineRunner:
             batch_id, attempt_id = self._store.create_batch(batch)
             try:
                 themes = await self._llm.analyze(batch)
+            except asyncio.CancelledError:
+                self._store.fail_batch(batch_id, attempt_id, "shutdown cancellation")
+                raise
             except Exception as error:  # noqa: BLE001 - failure is durable pipeline state
                 self._store.fail_batch(batch_id, attempt_id, str(error))
                 failed += 1
             else:
                 self._store.complete_batch(batch_id, attempt_id, themes)
                 completed += 1
-
-        return RunSummary(discovered, len(candidates), completed, failed)
+        return completed, failed
 
     def list_themes(self) -> list[Theme]:
         return self._store.list_themes()
@@ -276,6 +325,10 @@ class PipelineRunner:
 
     def list_posts(self, source: str | None = None) -> list[Post]:
         return self._store.list_posts(source)
+
+    @property
+    def sources(self) -> dict[str, SourceClient]:
+        return self._sources
 
     def close(self) -> None:
         self._store.close()
