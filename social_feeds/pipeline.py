@@ -37,6 +37,7 @@ class RunSummary:
 class SourceBatch:
     posts: Sequence[Post]
     cursor: int | str | None = None
+    metadata: dict[str, str] | None = None
 
 
 class SourceClient(Protocol):
@@ -67,6 +68,11 @@ class _Store:
             CREATE TABLE IF NOT EXISTS source_cursors (
                 source_key TEXT PRIMARY KEY,
                 watermark INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS source_metadata (
+                source_key TEXT PRIMARY KEY,
+                etag TEXT NOT NULL DEFAULT '',
+                last_modified TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS batches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -181,6 +187,21 @@ class _Store:
         rows = self.connection.execute("SELECT status FROM batches ORDER BY id").fetchall()
         return [row["status"] for row in rows]
 
+    def list_posts(self, source: str | None = None) -> list[Post]:
+        if source is None:
+            rows = self.connection.execute(
+                "SELECT source, source_id, title, url, text, published_at FROM posts ORDER BY rowid"
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT source, source_id, title, url, text, published_at FROM posts WHERE source = ? ORDER BY rowid",
+                (source,),
+            ).fetchall()
+        return [
+            Post(row["source"], row["source_id"], row["title"], row["url"], row["text"], row["published_at"])
+            for row in rows
+        ]
+
     def close(self) -> None:
         self.connection.close()
 
@@ -222,6 +243,14 @@ class PipelineRunner:
                 if commit_cursor is None:
                     raise ValueError("source returned a cursor but cannot commit it")
                 commit_cursor(source_batch.cursor)
+            if source_batch.metadata is not None:
+                commit_metadata = getattr(source, "commit_metadata", None)
+                if commit_metadata is None:
+                    raise ValueError("source returned metadata but cannot commit it")
+                commit_metadata(source_batch.metadata)
+            expire_content = getattr(source, "expire_content", None)
+            if expire_content is not None:
+                expire_content()
 
         completed = 0
         failed = 0
@@ -244,6 +273,9 @@ class PipelineRunner:
 
     def list_batch_statuses(self) -> list[str]:
         return self._store.list_batch_statuses()
+
+    def list_posts(self, source: str | None = None) -> list[Post]:
+        return self._store.list_posts(source)
 
     def close(self) -> None:
         self._store.close()
