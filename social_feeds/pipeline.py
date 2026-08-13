@@ -33,8 +33,14 @@ class RunSummary:
     failed_batches: int
 
 
+@dataclass(frozen=True)
+class SourceBatch:
+    posts: Sequence[Post]
+    cursor: int | str | None = None
+
+
 class SourceClient(Protocol):
-    async def fetch(self) -> Sequence[Post]: ...
+    async def fetch(self) -> Sequence[Post] | SourceBatch: ...
 
 
 class LlmClient(Protocol):
@@ -57,6 +63,10 @@ class _Store:
                 published_at TEXT,
                 status TEXT NOT NULL CHECK (status IN ('discovered', 'candidate', 'batched', 'completed')),
                 PRIMARY KEY (source, source_id)
+            );
+            CREATE TABLE IF NOT EXISTS source_cursors (
+                source_key TEXT PRIMARY KEY,
+                watermark INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS batches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -196,14 +206,22 @@ class PipelineRunner:
         discovered = 0
         candidates: list[Post] = []
         for source_name, source in self._sources.items():
-            for post in await source.fetch():
-                if post.source != source_name:
+            fetched = await source.fetch()
+            source_batch = fetched if isinstance(fetched, SourceBatch) else SourceBatch(fetched)
+            expected_source = getattr(source, "source_name", source_name)
+            for post in source_batch.posts:
+                if post.source != expected_source:
                     raise ValueError("source client returned a post for another source")
                 if self._store.add_post(post):
                     discovered += 1
                     if self._is_candidate(post):
                         self._store.mark_candidate(post)
                         candidates.append(post)
+            if source_batch.cursor is not None:
+                commit_cursor = getattr(source, "commit_cursor", None)
+                if commit_cursor is None:
+                    raise ValueError("source returned a cursor but cannot commit it")
+                commit_cursor(source_batch.cursor)
 
         completed = 0
         failed = 0
