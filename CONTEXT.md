@@ -27,3 +27,7 @@ _Avoid_: Topic, insight
 **Operational summary**:
 A durable account of source activity, batch outcomes, retries, and failures for an operating period.
 _Avoid_: Report, dashboard
+
+**Dashboard**:
+A local, read-only presentation surface for current service health, operational summaries, batches, failures, and themes.
+_Avoid_: Control panel, admin console
